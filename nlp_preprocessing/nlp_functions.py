@@ -1,10 +1,13 @@
 import re
 import pandas as pd
 import pymorphy2
-import stop_words
+from joblib import Parallel, delayed
+from preprocessing_functions import stop_words
 from spellchecker import SpellChecker  # библиотека используется для удаления слов с ошибками
-from pyaspeller import YandexSpeller  # библиотека используется для замены слов с ошибками (работает в разы быстрее спеллчекера)
+from pyaspeller import \
+    YandexSpeller  # библиотека используется для замены слов с ошибками (работает в разы быстрее спеллчекера)
 from functools import lru_cache
+from datetime import datetime
 
 
 # Приведение строк к нижнему регистру
@@ -17,6 +20,13 @@ def lower_case(data, text_field):
 def del_spaces(data, text_field):
     data[text_field].replace(to_replace='\s\s+', value=' ', regex=True, inplace=True)
     return data
+
+
+# удаление месяцев
+def del_months(data, text_field):
+    month_reg = r'январь|февраль|март|апрель|май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь'
+    month_reg = re.compile(month_reg, re.IGNORECASE)
+    return data[text_field].apply(lambda x: re.sub(month_reg, ' ', x))
 
 
 # удаление разных символов не являющиеся цифрами и буквами
@@ -87,6 +97,8 @@ def remove_stop_words(data, text_field, mode, new_stopwords):
 
     data[text_field] = data[text_field].apply(lambda x: re.sub(stop_words_to_reg, '', x))
 
+    data[text_field] = data[text_field].apply(lambda x: re.sub('\s\s+', ' ', x))  # удаляем лишние пробелы
+
     return data
 
 
@@ -120,7 +132,7 @@ def spell_check_token(token, russian, need_del):
     return token
 
 
-# Принадлежность слова к одной из сущности, замена / удаление
+# Принадлежность слова к одной из сущностей, замена / удаление
 def ner_token(token,
               parsed_token,
               need_del_name,
@@ -180,6 +192,11 @@ def lemmatizer_ner_spellchecker(train,
                                 need_del_spell,
                                 need_lru_cache,
                                 need_del_months):
+    num_iter = 0
+    rows_train = train.shape[0]
+    rows_oos = oos.shape[0]
+    rows_oot = oot.shape[0]
+
     # преобразование каждой строки
     def string_preprocessing(text,
                              need_spellchecker,
@@ -193,11 +210,13 @@ def lemmatizer_ner_spellchecker(train,
                              need_lru_cache,
                              pymorph,
                              russian,
-                             speller):
+                             speller,
+                             rows_df,
+                             type_df):
 
         # проверка на ошибки с ипользованием яндекс чекера / замена на правильно написанные слова
         if need_spellchecker and not need_del_spell:
-            text = speller.spelled(text)  # работает быстрее, чем проверять по каждому слову в отдельности
+            text = speller.spelled(text)  # работает быстрее, чем проверять по каждому слову по отдельности
 
         # разбиваем текст на токены в виде списка
         tokens = [token for token in text.lower().split(' ') if token not in ['']]
@@ -207,13 +226,14 @@ def lemmatizer_ner_spellchecker(train,
 
         for token in tokens:
 
-            # при удалении слов с ошибками используется другой алгоритм
+            # при удалении слов с ошибками используется другая библиотека
             if need_spellchecker and need_del_spell:
-                token = spell_check_token(token, russian, need_del_spell)  # работает в разы медленне, чем от яндекса
+                # работает в разы медленне, чем библиотека от яндекса
+                token = spell_check_token(token, russian, need_del_spell)
             else:
                 pass
 
-            # потом находим его нормальную форму
+            # далее находим нормальную форму слова
             if need_lemma:
                 parsed_token = parse_lru_cache(token, pymorph) if need_lru_cache else parse_without_cache(token,
                                                                                                           pymorph)
@@ -221,7 +241,7 @@ def lemmatizer_ner_spellchecker(train,
             else:
                 pass
 
-            # и только потом ищем сущности
+            # только после всех преобразований ищем сущности
             if need_ner:
                 token = ner_token(token,
                                   parsed_token,
@@ -241,7 +261,11 @@ def lemmatizer_ner_spellchecker(train,
         if need_ner:
             new_text = del_repeat_entity(new_text)
 
-        # возвращаем все в одну строку, заодно подчищаем лишние пробелы
+        nonlocal num_iter
+        num_iter += 1
+        # print(num_iter)
+        print('\rProgress {} lemmatization/ner/spellchecker: {} / {}'.format(type_df, num_iter, rows_df), end='')
+
         return new_text
 
     pymorph = pymorphy2.MorphAnalyzer()
@@ -249,7 +273,23 @@ def lemmatizer_ner_spellchecker(train,
     speller = YandexSpeller()
 
     # обращаемся к каждой ячейке
-    train[text_field] = train[text_field].apply(lambda x: string_preprocessing(str(x),
+    # train[text_field] = train[text_field].apply(lambda x: string_preprocessing(str(x),
+    #                                                                            need_spellchecker,
+    #                                                                            need_lemma,
+    #                                                                            need_ner,
+    #                                                                            need_del_name,
+    #                                                                            need_del_geo,
+    #                                                                            need_del_org,
+    #                                                                            need_del_numb,
+    #                                                                            need_del_spell,
+    #                                                                            need_lru_cache,
+    #                                                                            pymorph,
+    #                                                                            russian,
+    #                                                                            speller,
+    #                                                                            rows_train,
+    #                                                                            'train'))
+
+    train[text_field] = Parallel(n_jobs=-1)(delayed(string_preprocessing)(str(x),
                                                                                need_spellchecker,
                                                                                need_lemma,
                                                                                need_ner,
@@ -261,13 +301,14 @@ def lemmatizer_ner_spellchecker(train,
                                                                                need_lru_cache,
                                                                                pymorph,
                                                                                russian,
-                                                                               speller))
+                                                                               speller,
+                                                                               rows_train,
+                                                                               'train') for x in train[text_field])
 
+    num_iter = 0
+    print()
     if need_del_months:  # удаление месяцев
-        # регулярка для удаления
-        month_reg = r'январь|февраль|март|апрель|май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь'
-        month_reg = re.compile(month_reg, re.IGNORECASE)
-        train[text_field] = train[text_field].apply(lambda x: re.sub(month_reg, ' ', x))
+        train[text_field] = del_months(train, text_field)
 
     # удаление пустых ячеек после преобразований
     train = train[(train[text_field].notna()) | (train[text_field] != '')]
@@ -285,11 +326,14 @@ def lemmatizer_ner_spellchecker(train,
                                                                                need_del_spell,
                                                                                need_lru_cache,
                                                                                pymorph,
-                                                                               russian))
+                                                                               russian,
+                                                                               speller,
+                                                                               rows_oos,
+                                                                               'oos'))
+        num_iter = 0
+        print()
         if need_del_months:  # удаление месяцев
-            month_reg = r'январь|февраль|март|апрель|май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь'
-            month_reg = re.compile(month_reg, re.IGNORECASE)
-            oos[text_field] = oos[text_field].apply(lambda x: re.sub(month_reg, ' ', x))
+            oos[text_field] = del_months(oos, text_field)
 
         oos = oos[(oos[text_field].notna()) | (oos[text_field] != '')]
 
@@ -305,11 +349,14 @@ def lemmatizer_ner_spellchecker(train,
                                                                                need_del_spell,
                                                                                need_lru_cache,
                                                                                pymorph,
-                                                                               russian))
+                                                                               russian,
+                                                                               speller,
+                                                                               rows_oot,
+                                                                               'oot'))
+        num_iter = 0
+        print()
         if need_del_months:  # удаление месяцев
-            month_reg = r'январь|февраль|март|апрель|май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь'
-            month_reg = re.compile(month_reg, re.IGNORECASE)
-            oot[text_field] = oot[text_field].apply(lambda x: re.sub(month_reg, ' ', x))
+            oot[text_field] = del_months(oot, text_field)
 
         oot = oot[(oot[text_field].notna()) | (oot[text_field] != '')]
 
@@ -323,7 +370,6 @@ def nlp_preprocessing(
         oos=None,
         oot=None,
         text_field=None,
-        target_name=None,  # ?? (потом удалить)
 
         # Простой препроцессинг
         need_del_dash=True,  # удаление тире
@@ -391,6 +437,8 @@ def nlp_preprocessing(
     else:
         oot = test_empty
 
+    start = datetime.now()
+
     # Простой препроцессинг
     train = trash_chars(train, new_text_field, need_lower_case, need_del_dash, need_del_number, need_del_in_brackets,
                         need_del_eng)
@@ -399,8 +447,12 @@ def nlp_preprocessing(
     oot = trash_chars(oot, new_text_field, need_lower_case, need_del_dash, need_del_number, need_del_in_brackets,
                       need_del_eng)
 
+    end_time = datetime.now() - start
+    print('Trash chars done! - {}\n'.format(end_time))
+
     # Поиск опечаток, лемматизация, сущности
     if need_spellchecker or need_lemma or need_ner:
+        start = datetime.now()
         train, oos, oot = lemmatizer_ner_spellchecker(train,
                                                       oos,
                                                       oot,
@@ -415,16 +467,25 @@ def nlp_preprocessing(
                                                       need_del_spell,
                                                       need_lru_cache,
                                                       need_del_months)
+        end_time = datetime.now() - start
+        print('\nLemmatization / Spellcheker / NER done! - {}'.format(end_time))
     else:
         pass
 
     #  Удаление стопслов
     if need_del_stopwords:
+        start = datetime.now()
+
         # stop_words = open('stop_words.txt', 'r').read().splitlines()  # дополненный список стопслов из nltk
         train = remove_stop_words(train, new_text_field, mode_stopwords, new_stopwords)
         oos = remove_stop_words(oos, new_text_field, mode_stopwords, new_stopwords)
         oot = remove_stop_words(oot, new_text_field, mode_stopwords, new_stopwords)
     else:
         pass
+
+    end_time = datetime.now() - start
+    print('\nDelete stop words done! - {}'.format(end_time))
+
+    print('Preprocessing done!')
 
     return train, oos, oot
